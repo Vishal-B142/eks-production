@@ -1,150 +1,106 @@
 # eks-production
 
-> Production Kubernetes cluster on AWS EKS — managed control plane, multi-AZ node groups, ALB Ingress, Cluster Autoscaler, IRSA, and Terraform-provisioned infrastructure.
+> Production Kubernetes cluster on AWS EKS — migration from k3s VPS. This runbook will be updated once the production cluster is live.
 
 Part of a two-tier Kubernetes strategy:
 
 | Repo | Environment | Platform | Status |
 |---|---|---|---|
-| [k3s-dev-staging](https://github.com/Vishal-B142/k3s-dev-staging) | Dev & Staging | k3s on Hostinger VPS | ✅ Live |
+| [k3s-dev-staging](https://github.com/Vishal-B142/k3s-dev-staging) | Dev & Staging | k3s on VPS | ✅ Live |
 | **eks-production** (this repo) | Production | AWS EKS | 🔄 In Progress |
 
 ---
 
-## Architecture
+## Planned Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                        AWS EKS                           │
-│                                                          │
-│   Route53 ──▶ ALB ──▶ ALB Ingress Controller            │
-│                              │                           │
-│   ┌───────────────────────────▼──────────────────────┐   │
-│   │         EKS Managed Node Groups                  │   │
-│   │   ┌─────────────┐   ┌─────────────┐              │   │
-│   │   │ ap-south-1a │   │ ap-south-1b │  Multi-AZ    │   │
-│   │   └─────────────┘   └─────────────┘              │   │
-│   └──────────────────────────────────────────────────┘   │
-│                          │                               │
-│   ┌──────────────────────▼────────────────────────────┐  │
-│   │  Namespaces                                       │  │
-│   │  ┌────────────────┐   ┌──────────────────────┐   │  │
-│   │  │   production   │   │     monitoring       │   │  │
-│   │  └────────────────┘   └──────────────────────┘   │  │
-│   └───────────────────────────────────────────────────┘  │
-│                                                          │
-│   Cluster Autoscaler │ HPA │ IRSA │ CloudWatch Logs      │
-└──────────────────────────────────────────────────────────┘
-```
-
----
-
-## Stack
-
-![EKS](https://img.shields.io/badge/AWS_EKS-232F3E?style=flat&logo=amazonaws&logoColor=white)
-![Terraform](https://img.shields.io/badge/Terraform-7B42BC?style=flat&logo=terraform&logoColor=white)
-![Helm](https://img.shields.io/badge/Helm-0F1689?style=flat&logo=helm&logoColor=white)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=flat&logo=kubernetes&logoColor=white)
-![AWS](https://img.shields.io/badge/AWS-232F3E?style=flat&logo=amazonaws&logoColor=white)
-
----
-
-## Repo Structure
-
-```
-eks-production/
-├── terraform/
-│   ├── main.tf                  # EKS cluster + VPC + node groups
-│   ├── variables.tf
-│   ├── outputs.tf
-│   ├── backend.tf               # Remote state — S3 + DynamoDB locking
-│   └── modules/
-│       ├── eks/
-│       ├── vpc/
-│       └── iam/
-├── namespaces/
-│   ├── production.yaml
-│   └── monitoring.yaml
-├── alb-ingress/
-│   ├── values.yaml              # AWS Load Balancer Controller Helm values
-│   └── ingress-example.yaml
-├── autoscaler/
-│   └── cluster-autoscaler.yaml
-├── irsa/
-│   └── service-account.yaml     # IAM Roles for Service Accounts
-├── resource-quotas/
-│   └── production-quota.yaml
-├── hpa/
-│   └── hpa-example.yaml        # Horizontal Pod Autoscaler
-└── README.md
+                          Internet
+                              │
+                              ▼
+                    Route 53 (DNS)
+                              │
+                              ▼
+                   AWS ALB (ALB Ingress Controller)
+                    SSL termination via ACM
+                              │
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+          ▼                   ▼                   ▼
+   api.example.com     ai.example.com    grafana.example.com  ...
+          │
+          ▼
+┌─────────────────────────────────────────────────────┐
+│  EKS Managed Node Groups  (ap-south-1)              │
+│                                                     │
+│  ┌─────────────────────┐  ┌─────────────────────┐  │
+│  │   prod-apps         │  │   prod-monitoring   │  │
+│  │   t3.large  min=2   │  │   t3.medium  min=1  │  │
+│  │   max=6  role=apps  │  │   max=2  role=mon   │  │
+│  └─────────────────────┘  └─────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────┐
+│  production namespace                               │
+│  Blue / Green deployments (same as k3s)             │
+│  HPA — CPU + Memory thresholds                      │
+└─────────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────┐
+│  monitoring namespace                               │
+│  Prometheus + Grafana (EBS gp2 persistence)         │
+│  Loki (S3 backend)  +  Fluent Bit DaemonSet         │
+└─────────────────────────────────────────────────────┘
+          │
+          ▼
+┌────────────────────────┐   ┌────────────────────────┐
+│   AWS ECR              │   │   AWS Secrets Manager  │
+│   Container registry   │   │   + External Secrets   │
+│   (already in use)     │   │   Operator (Phase 2)   │
+└────────────────────────┘   └────────────────────────┘
 ```
 
 ---
 
-## Terraform — EKS Cluster
+## Key Differences from k3s Dev/Staging
 
-```hcl
-module "eks" {
-  source          = "terraform-aws-modules/eks/aws"
-  cluster_name    = "prod-cluster"
-  cluster_version = "1.29"
-  vpc_id          = module.vpc.vpc_id
-  subnet_ids      = module.vpc.private_subnets
-
-  eks_managed_node_groups = {
-    production = {
-      min_size       = 2
-      max_size       = 6
-      desired_size   = 2
-      instance_types = ["t3.medium"]
-    }
-  }
-}
-```
-
-## Setup
-
-```bash
-# 1. Provision EKS via Terraform
-cd terraform
-terraform init
-terraform plan
-terraform apply
-
-# 2. Configure kubectl
-aws eks update-kubeconfig --region ap-south-1 --name prod-cluster
-
-# 3. Install AWS Load Balancer Controller
-helm repo add eks https://aws.github.io/eks-charts
-helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-  -n kube-system --set clusterName=prod-cluster
-
-# 4. Install Cluster Autoscaler
-kubectl apply -f autoscaler/cluster-autoscaler.yaml
-
-# 5. Apply namespaces and quotas
-kubectl apply -f namespaces/
-kubectl apply -f resource-quotas/
-```
+| Component | k3s (dev/staging) | EKS (production) |
+|---|---|---|
+| Ingress | Traefik + MetalLB | AWS ALB Ingress Controller |
+| SSL | certbot + Let's Encrypt | AWS ACM (auto-renews) |
+| Storage | emptyDir / local-path | EBS gp2 (Grafana, Prometheus) |
+| Logs backend | Filesystem | S3 |
+| Log shipper | Promtail | Fluent Bit |
+| Secrets | k8s Secrets (base64) | AWS Secrets Manager + ESO |
+| HA | Single VPS node | Multi-AZ node groups |
+| Autoscaling | HPA only | HPA + Cluster Autoscaler |
 
 ---
 
-## Planned Features
+## Migration Checklist
 
-- [x] EKS cluster Terraform module
-- [x] Multi-AZ node groups
-- [x] ALB Ingress Controller
-- [ ] Cluster Autoscaler
-- [ ] HPA per service
-- [ ] IRSA — zero static credentials
-- [ ] CloudWatch Container Insights
-- [ ] Migrate workloads from k3s staging
+- [ ] Create EKS cluster with eksctl
+- [ ] Install AWS Load Balancer Controller
+- [ ] Request ACM wildcard certificate
+- [ ] Update ingress annotations (Traefik → ALB)
+- [ ] Apply deployments + HPA (unchanged from k3s)
+- [ ] Update monitoring-values.yaml for EBS persistence
+- [ ] Update loki-values.yaml for S3 backend
+- [ ] Smoke test via port-forward
+- [ ] Lower Route 53 TTLs to 60s (24hrs before cutover)
+- [ ] Switch Route 53 → ALB DNS
+- [ ] Monitor 72 hours → decommission VPS
+
+---
+
+## 🚧 This README will be updated with full runbook, YAML configs, and architecture diagram once the production cluster is live.
 
 ---
 
 ## Related
 
-- [k3s-dev-staging](https://github.com/Vishal-B142/k3s-dev-staging) — dev and staging cluster
-- [jenkins-k8s-pipeline](https://github.com/Vishal-B142/jenkins-k8s-pipeline) — CI/CD deploying to this cluster
-- [terraform-aws-infra](https://github.com/Vishal-B142/terraform-aws-infra) — shared AWS Terraform modules
-- [observability-stack](https://github.com/Vishal-B142/observability-stack) — monitoring for production
+- [k3s-dev-staging](https://github.com/Vishal-B142/k3s-dev-staging) — current live cluster (dev & staging)
+- [jenkins-k8s-pipeline](https://github.com/Vishal-B142/jenkins-k8s-pipeline) — CI/CD pipeline
+- [terraform-aws-infra](https://github.com/Vishal-B142/terraform-aws-infra) — Terraform modules
+- [observability-stack](https://github.com/Vishal-B142/observability-stack) — monitoring stack
